@@ -1,0 +1,73 @@
+# ---------------------------------------------------------------------------
+# Parametres de optimiseur_hauteur_courbure.py
+#
+# Lu a chaque execution :   python3 optimiseur_hauteur_courbure.py
+# Le script ne prend aucun argument en ligne de commande.
+#
+# Toutes les cles sont obligatoires ; une cle inconnue ou mal orthographiee
+# est refusee. `null` = valeur par defaut indiquee en commentaire.
+# Les chemins relatifs partent du dossier du script (racine de l'outil).
+#
+# Organisation :
+#   aoi, entrees_sorties, vehicule, courbure, altitude  -> communs aux deux modes
+#   mode_aoi                                            -> mode AOI seulement
+#   mode_trajectoire                                    -> mode trajectoire seulement
+#                                                          (ignore en mode AOI)
+# ---------------------------------------------------------------------------
+
+# true  : mode AOI, correction directe des lanelets entierement couverts par
+#         une zone AOI de la carte (way subtype=AOI), sans trajectoire
+# false : mode trajectoire, recalage de l'altitude sur mode_trajectoire.traj
+aoi: true
+
+
+# =========================== Parametres communs ============================
+
+entrees_sorties:
+  carte: lanelet2_map.osm       # carte Lanelet2 .osm
+  sortie_carte: null            # null : <carte>_OUT.osm
+  rapport: null                 # null : log/<carte>_rapport_<AAAAMMJJ_HHMMSS>.txt
+                                # (un chemin donne recoit aussi l'horodatage)
+  graphique: false              # enregistrer les figures PNG (<carte>_OUT.png)
+  silencieux: false             # pas de sortie console (le rapport est ecrit)
+
+vehicule:
+  fichier: config/vehicle_model.yaml  # modeles du parc, ou vehicle_info.param.yaml Autoware
+  modele: milla_bus_l3h2                  # null : modele_par_defaut du fichier
+  lister_vehicules: false       # afficher les modeles disponibles puis quitter
+  # surcharges du modele (null : valeur du fichier vehicule)
+  angle_braquage_max: null      # braquage max des roues avant (deg)
+  empattement: null             # (m)
+  marge_courbure: null          # facteur de garde sur la courbure (<1 = plus severe)
+
+courbure:
+  ecart_max: 0.30               # deplacement lateral maximal d'un point / noeud (m)
+  pas_reech: 1.0                # pas de reechantillonnage (m)
+  sans_courbure: false          # desactiver la correction des depassements de k_max
+
+altitude:
+  fenetre_z: 25.0               # fenetre de lissage de l'altitude (m)
+  sans_lissage_z: false         # desactiver le lissage de l'altitude
+  precision: 4                  # decimales ecrites dans ele / local_x / local_y
+
+
+# ========================= Mode AOI (aoi: true) ============================
+
+mode_aoi:
+  base_courbure: null           # demi-base de mesure de la courbure (m) ; null : empattement
+  fenetre_laterale: 10.0        # longueur d'onde de coupure du lissage lateral (m)
+  sans_lissage_lateral: false   # desactiver le lissage lateral
+  noeuds_ajoutes_max: 3         # noeuds inseres au plus par borne (0 = aucun)
+
+
+# ================ Mode trajectoire (aoi: false) - ignore en mode AOI =======
+
+mode_trajectoire:
+  traj: traj.csv                # trajectoire CSV x,y,z[,yaw]
+  sortie_traj: null             # null : <traj>_OUT.csv
+  pas_min: 0.30                 # distance min entre points bruts conserves (m)
+  seuil_rebroussement: 90.0     # variation de cap au-dela de laquelle on coupe (deg)
+  distance_max: 12.0            # rayon max d'appariement KNN (m)
+  ecart_min_z: 0.20             # ecart d'altitude en deca duquel on ne modifie pas (m)
+  offset_capteur: null          # hauteur soustraite a Z (m) ; null : hauteur_capteur du modele
+  ele_nul_mediane: false        # altitude mediane aux noeuds ele=0 sans voisin

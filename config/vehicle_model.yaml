@@ -1,0 +1,95 @@
+# ---------------------------------------------------------------------------
+# Modeles de vehicule pour optimiseur_hauteur_courbure.py
+#
+# La courbure maximale admissible est deduite du modele bicyclette :
+#     R_min = empattement / tan(angle_braquage_max)
+#     k_max = marge_courbure / R_min
+#
+# Selection :  vehicule.modele dans config/config.yaml
+#              (null : modele_par_defaut ci-dessous)
+# Liste     :  vehicule.lister_vehicules: true dans config/config.yaml
+#
+# Le script accepte aussi directement un fichier Autoware
+# vehicle_info.param.yaml, ce qui evite de dupliquer les valeurs :
+#     vehicule.fichier: .../lohr_cristal_description/config/vehicle_info.param.yaml
+# (Autoware exprime max_steer_angle en radians, la conversion est automatique.)
+# ---------------------------------------------------------------------------
+
+modele_par_defaut: lohr_cristal
+
+vehicules:
+
+  lohr_cristal:
+    description: "Lohr Cristal"
+    empattement: 2.670          # [m]  wheel_base
+    angle_braquage_max: 30.00   # [deg] = 0.5236 rad
+    hauteur_capteur: 0.26       # [m]  A VERIFIER (cf. note en bas de fichier)
+    marge_courbure: 1.0
+    # informatif
+    voie: 1.630                 # wheel_tread
+    hauteur_vehicule: 2.542
+    source: "lohr_cristal_description/config/vehicle_info.param.yaml"
+
+  milla_car_l2h2:
+    description: "Milla Car L2H2"
+    empattement: 3.682
+    angle_braquage_max: 34.38   # [deg] = 0.60 rad
+    hauteur_capteur: 0.26
+    marge_courbure: 1.0
+    voie: 1.750
+    hauteur_vehicule: 2.499
+    source: "milla_car_l2h2_description/config/vehicle_info.param.yaml"
+
+  milla_car_l3h2:
+    description: "Milla Car L3H2"
+    empattement: 4.332
+    angle_braquage_max: 34.38
+    hauteur_capteur: 0.26
+    marge_courbure: 1.0
+    voie: 1.750
+    hauteur_vehicule: 2.488
+    source: "milla_car_l3h2_description/config/vehicle_info.param.yaml"
+
+  milla_bus_l3h2:
+    description: "Milla Bus L3H2"
+    empattement: 4.332
+    angle_braquage_max: 34.38
+    hauteur_capteur: 0.26
+    marge_courbure: 0.8
+    voie: 1.750
+    hauteur_vehicule: 2.488
+    source: "milla_bus_l3h2_description/config/vehicle_info.param.yaml"
+
+  renault_master_l2h2:
+    description: "Renault Master L2H2"
+    empattement: 3.682
+    angle_braquage_max: 34.38
+    hauteur_capteur: 0.26
+    marge_courbure: 1.0
+    voie: 1.750
+    hauteur_vehicule: 2.499
+    source: "renault_master_l2h2_description/config/vehicle_info.param.yaml"
+
+  renault_master_l3h2:
+    description: "Renault Master L3H2"
+    empattement: 4.332
+    angle_braquage_max: 34.38
+    hauteur_capteur: 0.26
+    marge_courbure: 1.0
+    voie: 1.750
+    hauteur_vehicule: 2.488
+    source: "renault_master_l3h2_description/config/vehicle_info.param.yaml"
+
+# ---------------------------------------------------------------------------
+# hauteur_capteur : hauteur, au-dessus du sol, du repere dans lequel la
+# trajectoire a ete enregistree (/tf). Elle est soustraite au Z de la
+# trajectoire pour obtenir l'altitude de la chaussee.
+#
+# La valeur 0.26 est reprise de l'ancien script optimiseur_hauteur_KNN.py et
+# n'a PAS ete verifiee vehicule par vehicule. Si la trajectoire est enregistree
+# dans base_link et que base_link est au niveau du sol, la valeur correcte
+# est 0.0. A mesurer avant exploitation.
+#
+# marge_courbure : facteur de garde applique a k_max. 1.0 = limite cinematique
+# theorique ; 0.8 laisse 20 % de marge de braquage au controleur.
+# ---------------------------------------------------------------------------

@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+
+# sorties generees par optimiseur_hauteur_courbure.py
+*_OUT.osm
+*_OUT.png
+*_rapport.txt
+log/
+*_OUT.csv
