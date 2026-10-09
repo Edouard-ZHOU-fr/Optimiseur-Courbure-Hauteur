@@ -24,7 +24,7 @@ vehicules:
     empattement: 2.670          # [m]  wheel_base
     angle_braquage_max: 30.00   # [deg] = 0.5236 rad
     hauteur_capteur: 0.26       # [m]  A VERIFIER (cf. note en bas de fichier)
-    marge_courbure: 1.0
+    marge_courbure: 0.8
     # informatif
     voie: 1.630                 # wheel_tread
     hauteur_vehicule: 2.542
@@ -35,7 +35,7 @@ vehicules:
     empattement: 3.682
     angle_braquage_max: 34.38   # [deg] = 0.60 rad
     hauteur_capteur: 0.26
-    marge_courbure: 1.0
+    marge_courbure: 0.8
     voie: 1.750
     hauteur_vehicule: 2.499
     source: "milla_car_l2h2_description/config/vehicle_info.param.yaml"
@@ -45,7 +45,7 @@ vehicules:
     empattement: 4.332
     angle_braquage_max: 34.38
     hauteur_capteur: 0.26
-    marge_courbure: 1.0
+    marge_courbure: 0.8
     voie: 1.750
     hauteur_vehicule: 2.488
     source: "milla_car_l3h2_description/config/vehicle_info.param.yaml"
@@ -55,7 +55,7 @@ vehicules:
     empattement: 4.332
     angle_braquage_max: 34.38
     hauteur_capteur: 0.26
-    marge_courbure: 0.8
+    marge_courbure: 0.9
     voie: 1.750
     hauteur_vehicule: 2.488
     source: "milla_bus_l3h2_description/config/vehicle_info.param.yaml"
@@ -65,7 +65,7 @@ vehicules:
     empattement: 3.682
     angle_braquage_max: 34.38
     hauteur_capteur: 0.26
-    marge_courbure: 1.0
+    marge_courbure: 0.8
     voie: 1.750
     hauteur_vehicule: 2.499
     source: "renault_master_l2h2_description/config/vehicle_info.param.yaml"

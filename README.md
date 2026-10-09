@@ -1,5 +1,7 @@
 # Optimiseur d'altitude Lanelet2 avec correction de courbure
 
+> Version chinoise : [README_zh.md](README_zh.md).
+
 Recale l'altitude (`ele`) des noeuds d'une carte Lanelet2 a partir d'une
 trajectoire reellement parcourue, et verifie que le trace reste compatible
 avec la cinematique du vehicule (rayon de braquage minimal).
@@ -12,11 +14,11 @@ leur altitude (cf. [Mode AOI](#mode-aoi)).
 
 | Fichier | Role |
 |---|---|
-| `optimiseur_hauteur_courbure.py` | Script principal : arguments, enchainement des etapes (`traiter_trajectoire`, `traiter_aoi`, `main`), constante `AOI`. |
+| `optimiseur_hauteur_courbure.py` | Script principal : lecture de la configuration, enchainement des etapes selon le mode (`traiter_trajectoire`, `traiter_aoi`, `main`). |
 | `utils/` | Fonctions, par theme (cf. ci-dessous). |
 | `config/config.yaml` | **Tous les parametres** d'execution, relus a chaque lancement. |
 | `config/vehicle_model.yaml` | Parametres des vehicules du parc. |
-| `traj.csv`, `exemples/Test.osm` | Jeu de donnees d'exemple du mode trajectoire. |
+| `exemples/traj.csv`, `exemples/Test.osm` | Jeu de donnees d'exemple du mode trajectoire. |
 | `log/` | Rapports horodates. |
 
 Le dossier est autonome : aucune dependance vers un autre repertoire du depot.
@@ -109,7 +111,7 @@ entrees_sorties:
   carte: exemples/Test.osm
   graphique: true               # ajouter les figures de controle
 mode_trajectoire:
-  traj: traj.csv
+  traj: exemples/traj.csv
 vehicule:
   modele: milla_bus_l3h2        # choisir un vehicule
   lister_vehicules: true        # lister les vehicules disponibles puis quitter
@@ -182,8 +184,7 @@ vehicule:
 Le script y lit `wheel_base` et `max_steer_angle`. Autoware exprime l'angle en
 **radians**, la conversion est automatique (0.60 rad -> 34.38 deg).
 
-`vehicule.fichier` doit etre un chemin : y mettre un nom de modele est refuse
-avec l'indication de le placer dans `vehicule.modele`.
+`vehicule.fichier` doit etre un chemin de fichier.
 
 ### Parc actuellement decrit
 
@@ -197,7 +198,9 @@ avec l'indication de le placer dans `vehicule.modele`.
 | `renault_master_l3h2` | 4.332 m | 34.38 deg | 6.33 m |
 
 `marge_courbure` durcit la contrainte sans toucher aux valeurs physiques :
-`0.8` reserve 20 % de debattement de braquage au controleur.
+`0.8` reserve 20 % de marge de **courbure** au controleur. Ce n'est pas 20 %
+de braquage : pour `lohr_cristal`, l'angle equivalent est d'environ 24.8 deg,
+et non 30 x 0.8 = 24 deg.
 
 ---
 
@@ -278,6 +281,18 @@ du point de trajectoire le plus proche, moins `hauteur_capteur`. Un noeud est
 modifie si son plus proche voisin est a moins de `mode_trajectoire.distance_max` **et** que
 l'ecart d'altitude atteint `mode_trajectoire.ecart_min_z`.
 
+
+**Elements proteges.** Feux, blocs optiques et panneaux (`traffic_light`,
+`light_bulbs`, `traffic_sign`) sont des linestrings en hauteur : leur `ele`
+est l'altitude de l'objet (environ 2 m au-dessus de la chaussee sur
+`lanelet2_map.osm`), pas celle de la route. Le critere de distance les
+rabattrait sur la chaussee. Leurs noeuds sont donc retires des modifications
+(`mode_trajectoire.types_proteges`) ; le rapport en donne le nombre :
+
+```
+  noeuds proteges          : 59 (26 way(s) traffic_light/light_bulbs/traffic_sign), dont 22 retires des modifications
+```
+
 ---
 
 ## Mode AOI
@@ -292,6 +307,83 @@ Aucune trajectoire n'est lue : toute la section `mode_trajectoire` est
 ignoree. La carte
 elle-meme est corrigee : **position (`local_x`, `local_y`, `lat`, `lon`) et
 altitude (`ele`)** des noeuds de bornes.
+
+### Schema d'ensemble
+
+```mermaid
+flowchart TD
+    CFG["config/config.yaml<br/>aoi: true"] --> VEH["Modele vehicule<br/>k_max = marge x tan(braquage max) / empattement"]
+    VEH --> CARTE["Lecture de la carte Lanelet2"]
+
+    subgraph A1["A1 - Selection"]
+        AOI["Zones AOI<br/>way subtype=AOI"] --> SEL{"Lanelet roulable<br/>entierement couvert ?"}
+        SEL -- non --> IGN["Ignore, compte dans le rapport"]
+        SEL -- oui --> TOPO["Bornes orientees<br/>voisins hors AOI figes"]
+        TOPO --> MOB["Noeuds mobiles / figes<br/>fige = partage avec un lanelet hors selection"]
+        MOB --> INS["Insertion de noeuds<br/>au plus noeuds_ajoutes_max par borne"]
+    end
+
+    subgraph PASSES["Passes A2 + A3 + A3b, au plus N_PASSES_ELAGAGE, toujours depuis la geometrie d'origine"]
+        CL["Centrelignes C = M.P<br/>echantillonnage fige sur la geometrie d'origine"]
+
+        subgraph A2["A2 - Correction laterale, budget commun ecart_max depuis l'origine"]
+            P1["Passe 1 : lissage lateral<br/>min lambda.(N.D3C)^2 + largeur + ancrage<br/>raccords ponderes x10"]
+            ANC{"Un noeud depasse ecart_max<br/>ou un point de courbure s'aggrave ?"}
+            RENF["Renforcer l'ancrage<br/>de ces noeuds seulement"]
+            REPLI["Repli : lambda reduit<br/>sur toute la zone"]
+            P2["Passe 2 : correction locale<br/>points au-dela de k_max, grappe par grappe<br/>D2C, lambda par bissection"]
+            P1 --> ANC
+            ANC -- oui --> RENF
+            RENF --> P1
+            RENF -. "non converge apres N_ANCRAGE" .-> REPLI
+            ANC -- non --> P2
+            REPLI --> P2
+        end
+
+        Z["A3 - Lissage de l'altitude<br/>le long des bornes, noeuds figes = conditions aux limites"]
+        ELAG{"A3b - Noeuds inseres encore alignes<br/>a moins de tolerance_noeuds_inseres ?"}
+        CL --> P1
+        P2 --> Z
+        Z --> ELAG
+        ELAG -- "oui : retires, nouvelle passe" --> CL
+    end
+
+    CTRL["Controle de la carte ecrite<br/>centrelignes re-echantillonnees sur la geometrie finale"]
+    A4["A4 - Ecriture<br/>ele, local_x, local_y<br/>lat/lon par jacobien local"]
+    OUT["carte_OUT.osm<br/>log/carte_rapport_AAAAMMJJ_HHMMSS.txt<br/>carte_OUT.png si graphique"]
+    RC{"Zones non corrigeables ?"}
+    R0["Code de retour 0"]
+    R2["Code de retour 2"]
+
+    CARTE --> AOI
+    INS --> CL
+    ELAG -- "non : geometrie stable" --> CTRL
+    CTRL --> A4
+    A4 --> OUT
+    A4 --> RC
+    RC -- non --> R0
+    RC -- oui --> R2
+```
+
+Lecture du schema :
+
+| Bloc | Role | Detail |
+|---|---|---|
+| A1 | Choisir quoi corriger et quoi garder fixe : seuls les lanelets entierement dans une AOI bougent, leurs voisins hors AOI servent de conditions aux limites. | [Zone AOI](#zone-aoi), [Noeuds mobiles et noeuds figes](#noeuds-mobiles-et-noeuds-figes), [Insertion de noeuds](#insertion-de-noeuds) |
+| A2 passe 1 | Rendre la variation de courbure continue partout (derivee de courbure projetee sur la normale), sans glissement le long de la route ; contraintes tenues noeud par noeud. | [A2](#a2-lissage-lateral-et-correction-de-courbure), [Raccords](#raccords-avec-les-voies-hors-aoi) |
+| A2 passe 2 | Ramener sous `k_max` les points qui le depassent encore, localement. | [A2](#a2-lissage-lateral-et-correction-de-courbure) |
+| A3 | Lisser l'altitude le long des bornes, sans toucher au devers. | [A3](#a3-lissage-de-laltitude) |
+| A3b | Retirer les noeuds inseres restes inutiles, puis tout recalculer depuis l'origine avec les noeuds restants, jusqu'a stabilite. | [Insertion de noeuds](#insertion-de-noeuds) |
+| Controle | Verifier la courbure telle qu'elle sera lue, sur la geometrie finale re-echantillonnee. | [Insertion de noeuds](#insertion-de-noeuds) |
+| A4 | Ecrire positions et altitudes, `lat/lon` coherents avec `local_x/local_y`. | [lat / lon](#lat--lon) |
+
+Le budget `courbure.ecart_max` est **commun** a toutes les etapes et mesure
+depuis la geometrie d'origine : aucune passe ne s'ajoute a la precedente, et
+l'ecart final a la carte d'origine reste borne par `ecart_max`.
+
+> Le schema est en [Mermaid](https://mermaid.js.org/) : rendu directement par
+> GitHub ; dans VS Code, l'apercu Markdown necessite l'extension *Markdown
+> Preview Mermaid Support*.
 
 ### Zone AOI
 
@@ -349,6 +441,56 @@ id de la carte), `lat/lon`, `local_x/local_y` et `ele` interpoles, puis sont
 lisses comme les autres. Ils sont inseres apres le dernier `node` du fichier
 et dans la liste `nd` du way.
 
+**Elagage des noeuds inutiles.** Beaucoup de noeuds inseres restent, apres
+lissage, alignes avec leurs voisins : ils n'apportent rien et alourdissent la
+carte. Apres le lissage de l'altitude (A3), un noeud insere est retire s'il
+reste a moins de `mode_aoi.tolerance_noeuds_inseres` (1 cm) de la corde de
+ses voisins conserves, **en plan et en altitude**. Le retrait est glouton (du
+plus aligne au moins aligne) et verifie a chaque pas que tous les points deja
+retires entre les deux voisins restent dans la tolerance. Seuls les noeuds
+inseres sont concernes, jamais les noeuds d'origine.
+
+**Re-optimisation apres elagage.** Les garanties d'A2 (budget d'ecart, aucun
+nouveau depassement de `k_max`) ont ete verifiees sur la geometrie *avant*
+elagage. Des qu'un elagage retire des noeuds, A2 puis A3 sont donc relances
+**depuis la geometrie d'origine** avec les noeuds restants (une passe
+remplace la precedente, elle ne s'y ajoute pas), puis un nouvel elagage, jusqu'a ce qu'une passe ne retire
+plus rien (`N_PASSES_ELAGAGE = 5` au plus ; si la limite est atteinte, une
+derniere passe A2 + A3 est faite sans elagage). La geometrie ecrite est ainsi
+exactement celle de la derniere passe A2 + A3, que le rapport detaille :
+
+```
+  passe 1 : 974 noeud(s) retire(s) (...), nouvelle passe A2 + A3 depuis la geometrie d'origine
+  passe 2 : 8 noeud(s) retire(s) (...)
+  ...
+  passe 5 : 0 noeud(s) retire(s) : geometrie stable
+  noeuds inseres          : 1041, dont 984 retires, 57 conserves
+```
+
+| AOI | `noeuds_ajoutes_max` | Inseres | Retires | Conserves | Passes |
+|---|---|---|---|---|---|
+| AOI de `lanelet2_map.osm` | 5 | 368 | 321 | 47 | 3 |
+| AOI de `lanelet2_map.osm` | 300 | 1041 | 984 | 57 | 5 |
+| zone de test G | 300 | 42 | 23 | 19 | 2 |
+
+Une re-optimisation avec moins de noeuds peut rendre quelques noeuds de plus
+inutiles (d'ou les passes suivantes). Courbure max, depassements et `|dk/ds|`
+restent equivalents a ceux du trace dense ; sur une zone de test, la cassure
+au raccord est passee de 17.7 a 19.4 deg (14 noeuds conserves au lieu de 20).
+`tolerance_noeuds_inseres: 0` desactive l'elagage (une seule passe).
+
+**Controle de la carte ecrite.** Pour rester lineaire, A2 echantillonne les
+centrelignes par fractions figees sur la geometrie d'origine ; Autoware, lui,
+les re-echantillonne sur la carte qu'il charge. En fin de traitement, la
+courbure est recalculee sur la geometrie finale, re-echantillonnee, et
+comparee a A2 (ecarts observes : quelques 1e-3 1/m) :
+
+```
+  k max 0.1984 1/m (A2 : 0.2002), points en exces 24 (A2 : 24), |dk/ds| max 0.0497 1/m2
+```
+
+Un avertissement est emis si ce controle trouve plus de depassements qu'A2.
+
 ### A2. Lissage lateral et correction de courbure
 
 La centreligne de chaque lanelet est echantillonnee au pas `courbure.pas_reech`, par
@@ -356,18 +498,43 @@ fractions egales de la longueur des deux bornes (meme construction que
 `generateFineCenterline` dans Autoware). Chaque echantillon est une
 combinaison lineaire fixe des noeuds des bornes (`C = M·P`), et `L = M_l·P`
 est le vecteur gauche - droite. Les variables sont les **noeuds** `X`, pas les
-echantillons. Deux passes, sous un **meme budget** `courbure.ecart_max` mesure depuis
-la geometrie d'origine :
+echantillons. Deux passes, sous un **budget commun** `courbure.ecart_max`
+mesure depuis la geometrie d'origine : c'est une borne stricte de l'ecart
+entre la carte ecrite et la carte d'origine, quel que soit le nombre d'etapes
+internes. Le rapport detaille la part de chaque passe :
+
+```
+  deplacement max par etape   : lissage 0.268 m, corrections 0.119 m ; cumule 0.294 m (budget commun 0.30 m)
+```
 
 **1. Lissage lateral global** — applique a tous les lanelets selectionnes,
 qu'ils depassent ou non `k_max`, pour une courbure a **variation continue** :
 
 ```
-min  λ Σ ‖Δ³C‖²  +  λ μ₁ Σ ‖L - L⁰‖²  +  Σ aᵢ ‖Xᵢ - X⁰ᵢ‖²,     λ = (fenetre / 2π·pas)⁶
+min  λ Σ (N⁰·Δ³C)²  +  λ μ₁ Σ ‖L - L⁰‖²  +  Σ aᵢ ‖Xᵢ - X⁰ᵢ‖²,     λ = (fenetre / 2π·pas)⁶
 ```
 
-`Δ³C` (difference troisieme) est la derivee de la courbure : on penalise les
-sauts de courbure, pas la courbure elle-meme. `mode_aoi.fenetre_laterale` (10 m) est
+`N⁰·Δ³C` est la derivee troisieme de la centreligne **projetee sur sa
+normale**, soit la derivee de la courbure `k'` : on penalise les sauts de
+courbure, pas la courbure elle-meme. Elle est calculee en **differences
+divisees** sur les abscisses curvilignes d'origine, et la normale `N⁰` est
+figee sur la geometrie d'origine (le probleme reste lineaire).
+
+Pourquoi pas une simple difference troisieme `Δ³C = C₃ - 3C₂ + 3C₁ - C₀` :
+elle suppose un pas uniforme, or les echantillons ne le sont pas (pas propre
+a chaque lanelet, bornes de formes differentes) ; son residu est alors non
+nul meme sur une droite, et dirige **le long** de la route. Et
+`d³r/ds³ = k'·N - k²·T` : la composante tangentielle ne mesure pas la
+variation de courbure. La penaliser faisait glisser les noeuds le long des
+bornes : sur l'AOI de `lanelet2_map.osm`, pres de la moitie du deplacement,
+jusqu'a 0.24 m, consommant le budget d'ecart sans rien lisser. Avec la
+projection normale : 0.05 m au plus le long des bornes, courbure et
+`|dk/ds|` equivalents. La passe 2 garde une difference seconde par
+coordonnee (une version projetee y donnait des carrefours moins bien
+corriges) ; dans les carrefours, une part du deplacement reste donc
+tangentielle.
+
+`mode_aoi.fenetre_laterale` (10 m) est
 la longueur d'onde de coupure du filtre. Le budget d'ecart est tenu **noeud
 par noeud** : l'ancrage `aᵢ` des seuls noeuds qui le depassent est renforce
 iterativement, pour ne pas affaiblir le lissage sur toute l'AOI a cause d'un
@@ -390,10 +557,40 @@ Le terme de largeur (`μ₁ = POIDS_LARGEUR_LISSAGE = 1.0`,
 se deforme pour servir les deux centrelignes : la largeur derive de 0.18 m
 sans lui, de 0.04 m avec.
 
-Le lissage lateral ne doit pas degrader la courbure : s'il ajoute un
-depassement de `k_max` ou releve la courbure maximale au-dela de
-`max(k_max, k d'origine)`, `λ` est reduit par bissection (`attenue pour ne pas
-degrader la courbure max` dans le rapport).
+Le lissage lateral ne doit pas degrader la courbure : en etalant un pic, il
+peut en remonter un autre. Comme le budget d'ecart, cette contrainte est
+tenue **localement** : tout point de centreligne qui finit au-dessus de
+`k_max` *et* de sa courbure d'origine fait ancrer les noeuds dont il depend,
+iterativement ; le reste de la zone garde un lissage plein. Le rapport donne
+le nombre de noeuds ancres pour chaque raison :
+
+```
+  lissage lateral         : fenetre 10.0 m, noeuds ancres : 23 par le budget d'ecart, 12 pour ne pas aggraver la courbure
+```
+
+Une version precedente reduisait `λ` sur **toute** l'AOI des qu'un seul
+endroit se degradait : sur l'AOI de `lanelet2_map.osm` (un carrefour a 24
+depassements insolubles), le lissage etait quasi annule partout (deplacement
+max 3 cm, 180 noeuds deplaces de plus de 5 mm). Avec l'ancrage local :
+719 noeuds deplaces, `|dk/ds|` max 0.0497 -> 0.0386 1/m2, cassure max aux
+raccords 4.7 -> 1.2 deg, courbure max et depassements inchanges. La
+reduction globale ne reste qu'en repli si l'ancrage ne converge pas
+(avertissement `ancrage local non converge` dans le rapport).
+
+Contrepartie dans les carrefours insolubles : le lissage lateral consomme une
+partie du budget commun, la passe 2 y a moins de marge. Un budget *par etape*
+(chaque passe repartant de sa propre position) a ete essaye puis abandonne :
+il revient a autoriser un deplacement total superieur a `ecart_max` (jusqu'a
+etapes x `ecart_max`), sans que le parametre le dise. A deplacement total
+egal, le budget commun fait aussi bien ou mieux :
+
+| Zone de test G | Depl. max | k max | Depassements | `\|dk/ds\|` max | Cassure |
+|---|---|---|---|---|---|
+| commun, `ecart_max: 0.30` | 0.294 m | 0.226 | 5 | 0.093 | 10.7 deg |
+| par etape, 0.30 (abandonne) | 0.382 m | 0.211 | 3 | 0.094 | 11.3 deg |
+| commun, `ecart_max: 0.45` | 0.415 m | 0.211 | 3 | 0.089 | 10.3 deg |
+
+Si un carrefour manque de marge, augmenter `ecart_max` : l'ecart reste garanti.
 
 `mode_aoi.sans_lissage_lateral` desactive la passe 1, `courbure.sans_courbure` la passe 2.
 
@@ -502,7 +699,7 @@ du **mode AOI** (`mode_aoi`) et ceux du **mode trajectoire**
 
 | Cle | Valeur | Role |
 |---|---|---|
-| `ecart_max` | 0.30 m | Deplacement lateral maximal d'un point (trajectoire) ou d'un noeud (AOI). |
+| `ecart_max` | 0.30 m | Deplacement lateral maximal d'un point (trajectoire) ou d'un noeud (AOI), depuis la geometrie d'origine ; en mode AOI, budget commun aux deux passes. |
 | `pas_reech` | 1.0 m | Pas de reechantillonnage de la trajectoire / des centrelignes. |
 | `sans_courbure` | `false` | Desactive l'etape 4 (passe 2 de A2 en mode AOI). |
 
@@ -522,6 +719,7 @@ du **mode AOI** (`mode_aoi`) et ceux du **mode trajectoire**
 | `fenetre_laterale` | 10.0 m | Longueur d'onde de coupure du lissage lateral. |
 | `sans_lissage_lateral` | `false` | Desactive le lissage lateral (passe 1 de A2). |
 | `noeuds_ajoutes_max` | 1 | Nombre maximal de noeuds inseres par borne (0 = aucun). |
+| `tolerance_noeuds_inseres` | 0.01 m | Noeud insere retire s'il reste aligne avec ses voisins a moins de cette distance, en plan et en altitude (0 = pas d'elagage). |
 
 ### Mode trajectoire : `mode_trajectoire`
 
@@ -529,7 +727,7 @@ Lus et verifies dans les deux modes, mais **sans effet en mode AOI**.
 
 | Cle | Valeur | Role |
 |---|---|---|
-| `traj` | `traj.csv` | Trajectoire CSV. |
+| `traj` | `exemples/traj.csv` | Trajectoire CSV. |
 | `sortie_traj` | `null` : `<traj>_OUT.csv` | Trajectoire corrigee. |
 | `pas_min` | 0.30 m | Distance min entre points bruts conserves. |
 | `seuil_rebroussement` | 90 deg | Variation de cap au-dela de laquelle on coupe. |
@@ -537,6 +735,7 @@ Lus et verifies dans les deux modes, mais **sans effet en mode AOI**.
 | `ecart_min_z` | 0.20 m | En deca, le noeud n'est pas modifie. |
 | `offset_capteur` | `null` : `hauteur_capteur` du modele | Hauteur soustraite a Z (m). |
 | `ele_nul_mediane` | `false` | Altitude mediane pour les noeuds `ele=0` sans voisin. |
+| `types_proteges` | `[traffic_light, light_bulbs, traffic_sign]` | Types de ways dont les noeuds ne sont jamais recales (`[]` : aucun). |
 
 Les constantes internes des algorithmes (`LAMBDA_*`, `POIDS_LARGEUR*`,
 `POIDS_RACCORD`, `N_ANCRAGE`...) restent dans `utils/courbure.py` et
@@ -548,7 +747,7 @@ Les constantes internes des algorithmes (`LAMBDA_*`, `POIDS_LARGEUR*`,
 
 | Fichier | Contenu |
 |---|---|
-| `<carte>_OUT.osm` | Carte Lanelet2. **Seul le tag `ele` est modifie** ; geometrie, ways, relations et autres tags sont conserves a l'identique. |
+| `<carte>_OUT.osm` | Carte Lanelet2. En mode trajectoire, **seul le tag `ele` est modifie** ; geometrie, ways, relations et autres tags sont conserves a l'identique. |
 | `<traj>_OUT.csv` | Trajectoire nettoyee, reechantillonnee, corrigee, `yaw` recalcule. |
 | `log/<carte>_rapport_<AAAAMMJJ_HHMMSS>.txt` | Journal complet (identique a la sortie console), horodate : un lancement n'ecrase jamais le rapport precedent. |
 | `<carte>_OUT.png` | Avec `entrees_sorties.graphique` : altitude brute, altitude lissee, courbure vs limite. En mode AOI : vue en plan avant/apres, courbure des centrelignes, altitude des noeuds mobiles. |

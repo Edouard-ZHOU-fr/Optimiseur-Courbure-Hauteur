@@ -27,10 +27,23 @@ N_ANCRAGE = 30          # mode AOI : iterations du budget d'ecart par noeud
 
 
 POIDS_RACCORD = 10.0    # mode AOI : poids du lissage a travers les raccords
+N_PASSES_ELAGAGE = 5    # mode AOI : passes max A2 -> A3 -> elagage
 
 
 # lanelets exclus de la correction : la contrainte de braquage n'y a pas de sens
 SOUS_TYPES_NON_ROULABLES = {"crosswalk", "walkway", "stairs"}
+
+
+def noeuds_proteges(arbre, types):
+    """Ids des noeuds des ways dont le tag `type` est dans `types`, et nombre
+    de ways concernes."""
+    ids, n_ways = set(), 0
+    for w in arbre.getroot().findall("way"):
+        tags = {t.get("k"): t.get("v") for t in w.findall("tag")}
+        if tags.get("type") in types:
+            ids.update(int(nd.get("ref")) for nd in w.findall("nd"))
+            n_ways += 1
+    return ids, n_ways
 
 
 def lire_topologie(arbre):
@@ -173,6 +186,46 @@ def _operateur(chemins, coefs, n):
                          shape=(m, n))
 
 
+def _operateur_normal(C, chemins, ordre, pas, n):
+    """Derivee d'ordre `ordre` de la centreligne le long des chemins, projetee
+    sur la normale, en differences divisees sur les abscisses curvilignes de
+    C (geometrie d'origine). Mise a l'echelle par pas**ordre : sur un pas
+    uniforme egal a `pas`, on retrouve les coefficients usuels (-1, 3, -3, 1
+    a l'ordre 3).
+
+    Une difference a coefficients fixes suppose un pas uniforme ; or les
+    echantillons ne le sont pas (pas propre a chaque lanelet, bornes de
+    formes differentes) : son residu est non nul meme sur une droite, et
+    dirige le long de la route. De plus d3r/ds3 = k' N - k^2 T : la
+    composante tangentielle ne mesure pas la variation de courbure. La
+    penaliser fait glisser les noeuds le long de la route, ce qui consomme le
+    budget d'ecart sans rien lisser. Seule la composante normale (k' a
+    l'ordre 3) est donc retenue ; la normale (celle de la corde du chemin)
+    est figee sur la geometrie d'origine pour que le probleme reste lineaire.
+    Renvoie (Nx, Ny), creuses (chemins x n) : residu = Nx @ Cx + Ny @ Cy."""
+    m, k = chemins.shape
+    Cc = C[chemins]
+    seg = np.linalg.norm(np.diff(Cc, axis=1), axis=2)
+    s = np.concatenate([np.zeros((m, 1)), np.cumsum(seg, axis=1)], axis=1)
+    ok = (seg > 1e-6).all(axis=1)          # echantillons confondus : ligne nulle
+    coef = np.zeros((m, k))
+    for i in range(k):
+        prod = np.ones(m)
+        for j in range(k):
+            if j != i:
+                prod = prod * (s[:, i] - s[:, j])
+        coef[:, i] = np.where(ok, math.factorial(ordre) * pas ** ordre
+                              / np.where(ok, prod, 1.0), 0.0)
+    corde = Cc[:, -1] - Cc[:, 0]
+    t = corde / np.maximum(np.linalg.norm(corde, axis=1), 1e-9)[:, None]
+    lignes = np.repeat(np.arange(m), k)
+
+    def projete(composante):
+        return sp.csr_matrix(((coef * composante[:, None]).ravel(),
+                              (lignes, chemins.ravel())), shape=(m, n))
+    return projete(-t[:, 1]), projete(t[:, 0])
+
+
 def _taux_courbure(C, ts, suivants, sommets=None):
     """|dk/ds| (1/m2) le long des aretes du graphe, k etant pris en chaque
     echantillon central des triplets controles. `sommets` : ne garder que
@@ -195,21 +248,42 @@ def _cassures(C, t1):
                                         (v1 * v2).sum(axis=1))))
 
 
+def controle_courbure(bornes, xy, pas, base, selection, contexte, k_max):
+    """Courbure des centrelignes de la geometrie finale, re-echantillonnees
+    sur celle-ci (comme Autoware au chargement de la carte), et non avec les
+    fractions figees sur la geometrie d'origine utilisees par l'optimisation.
+    Renvoie (k max, nb de points en exces, |dk/ds| max)."""
+    cl = Centrelignes({lid: bornes[lid] for lid in sorted(selection | contexte)},
+                      xy, pas)
+    C = cl.M @ xy(cl.ids)
+    ts = cl.triplets(max(1, int(round(base / pas))))
+    ts = ts[[bool(cl.proprio[b] & selection) for b in ts[:, 1]]]
+    k = menger(C[ts[:, 0]], C[ts[:, 1]], C[ts[:, 2]])
+    return (k.max(initial=0.0), int((k > k_max).sum()),
+            _taux_courbure(C, ts, cl.suivants).max(initial=0.0))
+
+
 def corriger_courbure_aoi(cl, P0, mobile, selection, contexte, k_max,
                           ecart_max, pas, base, empattement, fenetre_lat,
                           corriger, jrn):
     """Correction laterale des centrelignes en deplacant les noeuds mobiles
-    des bornes, en deux temps, sous un meme budget d'ecart (mesure depuis la
-    geometrie d'origine) :
+    des bornes, en deux temps, sous un budget d'ecart `ecart_max` commun,
+    mesure depuis la geometrie d'origine : c'est une borne stricte de l'ecart
+    entre la carte ecrite et la carte d'origine, independante du nombre
+    d'etapes internes. (Un budget par etape a ete essaye : son seul gain
+    venait d'un deplacement total plus grand, que l'on obtient aussi bien,
+    garanti, en augmentant ecart_max.)
 
     1. lissage lateral global (fenetre_lat > 0), pour une courbure a
        variation continue :
-           min  lam sum |D3 C|^2 + lam mu sum |L - L0|^2 + sum |X - X0|^2
-       D3 difference troisieme le long des centrelignes, soit la derivee de
-       la courbure : on penalise les sauts de courbure et non la courbure.
+           min  lam sum |N.D3 C|^2 + lam mu sum |L - L0|^2 + sum a_i |X_i - X0_i|^2
+       N.D3 C : derivee troisieme de la centreligne projetee sur la normale
+       (differences divisees, cf. _operateur_normal), soit la derivee de la
+       courbure k' : on penalise les sauts de courbure et non la courbure, et
+       aucune force ne pousse les noeuds le long de la route.
        lam = (fenetre / 2 pi pas)^6 place la coupure du filtre a une longueur
-       d'onde `fenetre_lat` ; si le budget d'ecart est depasse, lam est reduit
-       par bissection.
+       d'onde `fenetre_lat`. Budget d'ecart et non-aggravation de la courbure
+       sont tenus noeud par noeud, par renforcement de l'ancrage a_i.
     2. correction locale des depassements de k_max (corriger=True), meme
        formulation que pour la trajectoire, en difference seconde :
            min  sum lam_i |D2 C|^2 + mu sum lam_i |L - L0|^2 + sum |X - X0|^2
@@ -228,7 +302,8 @@ def corriger_courbure_aoi(cl, P0, mobile, selection, contexte, k_max,
     ts = ts[[bool(cl.proprio[b] & selection) for b in ts[:, 1]]]
     jrn("  courbure max admissible : %.4f 1/m  (rayon min %.2f m)"
         % (k_max, 1.0 / k_max))
-    jrn("  ecart lateral autorise  : %.2f m (cumul des deux passes)" % ecart_max)
+    jrn("  ecart lateral autorise  : %.2f m depuis la geometrie d'origine "
+        "(commun aux deux passes)" % ecart_max)
     jrn("  centrelignes            : %d echantillons au pas %.2f m"
         % (cl.M.shape[0], pas))
     jrn("  base de courbure        : +/- %.2f m (%d echantillons)" % (s * pas, s))
@@ -250,17 +325,26 @@ def corriger_courbure_aoi(cl, P0, mobile, selection, contexte, k_max,
     def ecart(Xc):
         return np.hypot(*(Xc - X_orig).T).max(initial=0.0)
 
-    def solveur(A, B, W, Wl, X_dep, ancre=None):
+    nm = len(im)
+    Al2 = sp.block_diag([Al, Al]).tocsr()
+    Bl2 = np.concatenate([Bl[:, 0], Bl[:, 1]])
+
+    def solveur(Ox, Oy, W, Wl, X_dep, ancre=None):
         """X(lam) minimisant
-            lam (|A X + B|_W^2 + |Al X + Bl|_Wl^2) + sum ancre_i |X_i - X_dep_i|^2."""
-        AtWA = (A.T @ W @ A + Al.T @ Wl @ Al).tocsc()
-        AtWB = A.T @ (W @ B) + Al.T @ (Wl @ Bl)
-        a = np.ones(len(im)) if ancre is None else ancre
+            lam (|Ox Px + Oy Py|_W^2 + |L - L0|_Wl^2) + sum ancre_i |X_i - X_dep_i|^2,
+        P = noeuds (mobiles X, figes P0). Ox, Oy couplent x et y (projection
+        sur la normale) : inconnue unique [X_x ; X_y]."""
+        A = sp.hstack([Ox[:, im], Oy[:, im]]).tocsr()
+        B = Ox[:, jf] @ P0[jf, 0] + Oy[:, jf] @ P0[jf, 1]
+        Wl2 = sp.block_diag([Wl, Wl])
+        H = (A.T @ W @ A + Al2.T @ Wl2 @ Al2).tocsc()
+        g = A.T @ (W @ B) + Al2.T @ (Wl2 @ Bl2)
+        a = np.tile(np.ones(nm) if ancre is None else ancre, 2)
+        x0 = np.concatenate([X_dep[:, 0], X_dep[:, 1]])
 
         def lisser(lam):
-            lu = spl.splu((sp.diags(a) + lam * AtWA).tocsc())
-            return np.column_stack([lu.solve(a * X_dep[:, c] - lam * AtWB[:, c])
-                                    for c in range(2)])
+            z = spl.splu((sp.diags(a) + lam * H).tocsc()).solve(a * x0 - lam * g)
+            return np.column_stack([z[:nm], z[nm:]])
         return lisser
 
     k_avant = k_de(centres(X_orig), ts)
@@ -283,8 +367,8 @@ def corriger_courbure_aoi(cl, P0, mobile, selection, contexte, k_max,
     if fenetre_lat > 0 and len(im):
         lam = (fenetre_lat / (2.0 * math.pi * pas)) ** 6
         chem4 = cl.chemins(4)
-        D3 = _operateur(chem4, [-1.0, 3.0, -3.0, 1.0], n_ech) @ cl.M
-        A3, B3 = D3[:, im].tocsr(), D3[:, jf] @ P0[jf]
+        Nx3, Ny3 = _operateur_normal(centres(X_orig), chem4, 3, pas, n_ech)
+        O3 = (Nx3 @ cl.M, Ny3 @ cl.M)
         # raccord lisse avec les voisins figes : les differences troisiemes a
         # cheval sur un lanelet traite et un voisin (continuite de position,
         # de tangente et de courbure) sont renforcees
@@ -293,39 +377,62 @@ def corriger_courbure_aoi(cl, P0, mobile, selection, contexte, k_max,
         a_cheval = sel_v[chem4].any(axis=1) & ctx_v[chem4].any(axis=1)
         W3 = sp.diags(np.where(a_cheval, POIDS_RACCORD, 1.0))
         Wl3 = POIDS_LARGEUR_LISSAGE * sp.identity(n_ech)
-        # Budget d'ecart noeud par noeud : l'ancrage des seuls noeuds qui le
-        # depassent est renforce, iterativement, pour que le lissage garde sa
+        # Contraintes tenues noeud par noeud : l'ancrage des seuls noeuds
+        # fautifs est renforce, iterativement, pour que le lissage garde sa
         # force partout ailleurs (une reduction globale de lambda le
-        # sacrifierait sur toute l'AOI pour un seul noeud contraint).
+        # sacrifierait sur toute l'AOI pour un seul endroit contraint).
+        #  - budget d'ecart : noeuds deplaces de plus de ecart_max ;
+        #  - courbure : le lissage de la derivee de courbure etale les pics
+        #    et peut en remonter d'autres. Un point de centreligne ne doit
+        #    pas finir au-dessus de k_max et de sa courbure d'origine : les
+        #    noeuds dont il depend sont ancres.
+        pos_im = np.full(cl.M.shape[1], -1)
+        pos_im[im] = np.arange(len(im))
+
+        def noeuds_de(echantillons):
+            cols = cl.M[np.unique(echantillons)].indices
+            p = pos_im[cols]
+            return np.unique(p[p >= 0])
+
+        def degrades(Xc):
+            k = k_de(centres(Xc), ts)
+            return (k > k_max) & (k > k_avant + 1e-9)
+
         ancre = np.ones(len(im))
+        retenus_ecart = np.zeros(len(im), dtype=bool)
+        retenus_courbure = np.zeros(len(im), dtype=bool)
         for _ in range(N_ANCRAGE):
-            X = solveur(A3, B3, W3, Wl3, X_orig, ancre)(lam)
+            X = solveur(*O3, W3, Wl3, X_orig, ancre)(lam)
             d = np.hypot(*(X - X_orig).T)
             trop = d > ecart_max
-            if not trop.any():
+            fautifs = noeuds_de(ts[degrades(X)].ravel())
+            if not trop.any() and not len(fautifs):
                 break
             ancre[trop] *= 2.0 * (d[trop] / ecart_max) ** 2
-        n_ancres = int((ancre > 1.0).sum())
-        # Le lissage de la derivee de courbure etale les pics mais peut en
-        # remonter d'autres : il ne doit ni ajouter de depassement de k_max
-        # ni relever la courbure maximale au-dela de max(k_max, k d'origine).
-        k_plafond = max(k_max, k_avant.max(initial=0.0))
-        n_viol0 = int((k_avant > k_max).sum())
+            ancre[fautifs] *= 4.0
+            retenus_ecart |= trop
+            retenus_courbure[fautifs] = True
 
         def admissible(Xc):
-            k = k_de(centres(Xc), ts)
-            return (ecart(Xc) <= ecart_max and int((k > k_max).sum()) <= n_viol0
-                    and k.max(initial=0.0) <= k_plafond + 1e-9)
+            return ecart(Xc) <= ecart_max and not degrades(Xc).any()
         reduit = not admissible(X)
         if reduit:
-            # repli : reduction globale de lambda, ancrage conserve
-            X = bissection(solveur(A3, B3, W3, Wl3, X_orig, ancre),
-                            admissible, -1, hi=lam)
+            # repli si l'ancrage local n'a pas converge : reduction globale de
+            # lambda, ancrage conserve
+            X = bissection(solveur(*O3, W3, Wl3, X_orig, ancre),
+                           admissible, -1, hi=lam)
             X = X_orig.copy() if X is None else X
+        retenus = []
+        if retenus_ecart.any():
+            retenus.append("%d par le budget d'ecart" % retenus_ecart.sum())
+        if retenus_courbure.any():
+            retenus.append("%d pour ne pas aggraver la courbure"
+                           % retenus_courbure.sum())
         jrn("  lissage lateral         : fenetre %.1f m%s%s"
-            % (fenetre_lat, ", %d noeud(s) retenu(s) par le budget d'ecart"
-               % n_ancres if n_ancres else "",
-               ", attenue pour ne pas degrader la courbure max" if reduit else ""))
+            % (fenetre_lat,
+               ", noeuds ancres : %s" % ", ".join(retenus) if retenus else "",
+               "\n    /!\\ ancrage local non converge : lissage attenue sur "
+               "toute la zone" if reduit else ""))
         C1 = centres(X)
         jrn("    ecart max %.3f m ; |dk/ds| max %.4f -> %.4f 1/m2, "
             "p95 %.4f -> %.4f 1/m2"
@@ -342,8 +449,10 @@ def corriger_courbure_aoi(cl, P0, mobile, selection, contexte, k_max,
     k_mi = k_de(C0, ts)
     viol = np.flatnonzero(k_mi > k_max)
     marge = 3.0 / k_max
+    # difference seconde par coordonnee : lignes x puis lignes y
     D2 = _operateur(t1, [1.0, -2.0, 1.0], n_ech) @ cl.M
-    A2, B2 = D2[:, im].tocsr(), D2[:, jf] @ P0[jf]
+    Z2 = sp.csr_matrix(D2.shape)
+    O2 = (sp.vstack([D2, Z2]).tocsr(), sp.vstack([Z2, D2]).tocsr())
     grappes = _grappes(C0[ts[viol, 1]], 2.0 * marge) if corriger and len(viol) else []
     if not corriger:
         jrn("  correction des depassements desactivee")
@@ -352,23 +461,29 @@ def corriger_courbure_aoi(cl, P0, mobile, selection, contexte, k_max,
         # champ de poids en cosinus sureleve autour des violations
         return 0.5 * (1.0 + np.cos(math.pi * np.minimum(d / marge, 1.0)))
 
+    X1 = X.copy()                   # resultat du lissage lateral
+    ecart_corrections = 0.0
     for grappe in grappes:
         arbre = cKDTree(C0[ts[viol[grappe], 1]])
-        W = sp.diags(cloche(arbre.query(C0[t1[:, 1]])[0]))
+        w2 = cloche(arbre.query(C0[t1[:, 1]])[0])
+        W = sp.diags(np.concatenate([w2, w2]))
         Wl = sp.diags(POIDS_LARGEUR * cloche(arbre.query(C0)[0]))
         zone = ts[arbre.query(C0[ts[:, 1]])[0] <= marge]
         X_dep = X.copy()
-        lisser = solveur(A2, B2, W, Wl, X_dep)
+        lisser = solveur(*O2, W, Wl, X_dep)
 
         def k_zone(Xc):
             return k_de(centres(Xc), zone).max(initial=0.0)
 
         if len(im):
+            # budget commun, mesure depuis la geometrie d'origine
             sol = bissection(lisser, lambda Xc: k_zone(Xc) <= k_max, +1)
             if sol is not None and ecart(sol) <= ecart_max:
                 X = sol
-                continue
-            X = lissage_admissible(lisser, X_dep, k_zone, ecart, ecart_max)
+            else:
+                X = lissage_admissible(lisser, X_dep, k_zone, ecart, ecart_max)
+            ecart_corrections = max(ecart_corrections,
+                                    np.hypot(*(X - X_dep).T).max(initial=0.0))
         kz = k_de(centres(X), zone)
         if kz.max(initial=0.0) > k_max:
             b = zone[np.argmax(kz), 1]
@@ -403,6 +518,10 @@ def corriger_courbure_aoi(cl, P0, mobile, selection, contexte, k_max,
     jrn("  noeuds deplaces             : %d / %d mobiles, moyen %.3f m, max %.3f m"
         % (bouges.sum(), len(im), ecarts[bouges].mean() if bouges.any() else 0.0,
            ecarts.max(initial=0.0)))
+    jrn("  deplacement max par etape   : lissage %.3f m, corrections %.3f m ; "
+        "cumule %.3f m (budget commun %.2f m)"
+        % (np.hypot(*(X1 - X_orig).T).max(initial=0.0), ecart_corrections,
+           ecarts.max(initial=0.0), ecart_max))
     journal_residus(jrn, residus)
     return P, residus, k_avant, k_apres
 
@@ -494,7 +613,7 @@ def densifier_bornes(arbre, noeuds, ways, voies, xy_de, z_de, bornes,
     lanelets selectionnes sont modifiees (une borne partagee avec un lanelet
     hors AOI changerait aussi celui-ci).
     Met a jour l'arbre XML, `noeuds`, `ways`, `xy_de`, `z_de`, `bornes`.
-    Renvoie (noeuds inseres, bornes densifiees, bornes partagees ignorees)."""
+    Renvoie (ids inseres, bornes densifiees, bornes partagees ignorees)."""
     usage = {}
     for lid, g, d, st in lanelets:
         usage.setdefault(g, set()).add(lid)
@@ -520,7 +639,7 @@ def densifier_bornes(arbre, noeuds, ways, voies, xy_de, z_de, bornes,
                 av, ap = ap, av
             voisins.setdefault(wid, (av, ap))
 
-    n_total, n_bornes, partagees = 0, 0, 0
+    inseres, n_bornes, partagees = set(), 0, 0
     for wid in sorted(voisins):
         if not usage.get(wid, set()) <= selection:
             partagees += 1
@@ -561,26 +680,85 @@ def densifier_bornes(arbre, noeuds, ways, voies, xy_de, z_de, bornes,
             refs.insert(i + 1, prochain)
             pts.insert(i + 1, m)
             ang.insert(i + 1, 0.0)
+            inseres.add(prochain)
             prochain += 1
             nouveaux += 1
         if not nouveaux:
             continue
-        # reecriture des <nd> du way, mise en forme conservee
-        w = elem_way[wid]
-        nds = w.findall("nd")
-        queue, derniere = nds[0].tail, nds[-1].tail
-        for nd in nds:
-            w.remove(nd)
-        for k, ref in enumerate(refs):
-            nd = ET.Element("nd", ref=str(ref))
-            nd.tail = derniere if k == len(refs) - 1 else queue
-            w.insert(k, nd)
+        _reecrire_nds(elem_way[wid], refs)
         ways[wid] = refs
-        n_total += nouveaux
         n_bornes += 1
 
     for lid in selection:
         g, d = voies[lid]
         bornes[lid] = orienter_bornes(np.array(ways[g]), np.array(ways[d]),
                                       lambda ids: np.array([xy_de[int(i)] for i in ids]))
-    return n_total, n_bornes, partagees
+    return inseres, n_bornes, partagees
+
+
+def _reecrire_nds(w, refs):
+    """Remplace la liste des <nd> du way `w`, mise en forme conservee."""
+    nds = w.findall("nd")
+    queue, derniere = nds[0].tail, nds[-1].tail
+    for nd in nds:
+        w.remove(nd)
+    for k, ref in enumerate(refs):
+        nd = ET.Element("nd", ref=str(ref))
+        nd.tail = derniere if k == len(refs) - 1 else queue
+        w.insert(k, nd)
+
+
+def _ecart_corde(pts, p, q):
+    """Ecarts (lateral, altitude) des points pts[p+1:q] a la corde pts[p] ->
+    pts[q] ; l'altitude de reference est interpolee le long de la corde."""
+    a, b, m = pts[p], pts[q], pts[p + 1:q]
+    ab = b[:2] - a[:2]
+    L2 = float(ab @ ab)
+    t = np.zeros(len(m)) if L2 == 0 else np.clip((m[:, :2] - a[:2]) @ ab / L2, 0, 1)
+    proj = a + t[:, None] * (b - a)
+    return np.hypot(*(m[:, :2] - proj[:, :2]).T), np.abs(m[:, 2] - proj[:, 2])
+
+
+def elaguer_noeuds_inseres(arbre, noeuds, ways, inseres, position, tol):
+    """Retire les noeuds inseres restes inutiles : ceux qui, apres lissage,
+    sont encore alignes (a `tol` pres, en plan et en altitude) avec leurs
+    voisins conserves. Retrait glouton, du plus aligne au moins aligne ; un
+    candidat n'est retire que si TOUS les points deja retires entre ses
+    voisins restent a moins de `tol` de la nouvelle corde : l'ecart cumule
+    entre la borne lissee et la borne elaguee est donc borne par `tol`.
+    `position` : {id: (x, y, z)} final. Met a jour l'arbre XML, `noeuds` et
+    `ways`. Renvoie (ids retires, ecart max introduit en m)."""
+    racine = arbre.getroot()
+    elem_way = {int(w.get("id")): w for w in racine.findall("way")}
+    retires, ecart_max = set(), 0.0
+    for wid, refs in ways.items():
+        if not inseres.intersection(refs):
+            continue
+        pts = np.array([position[i] for i in refs], dtype=float)
+        garde = np.ones(len(refs), dtype=bool)
+        while True:
+            idx = np.flatnonzero(garde)
+            meilleur = None
+            for j in range(1, len(idx) - 1):
+                k = idx[j]
+                if refs[k] not in inseres:
+                    continue
+                dl, dz = _ecart_corde(pts, idx[j - 1], idx[j + 1])
+                e = max(dl.max(initial=0.0), dz.max(initial=0.0))
+                if e <= tol and (meilleur is None or e < meilleur[0]):
+                    meilleur = (e, k)
+            if meilleur is None:
+                break
+            garde[meilleur[1]] = False
+            ecart_max = max(ecart_max, meilleur[0])
+        if garde.all():
+            continue
+        retires.update(refs[k] for k in np.flatnonzero(~garde))
+        refs = [r for r, g in zip(refs, garde) if g]
+        _reecrire_nds(elem_way[wid], refs)
+        ways[wid] = refs
+    if retires:
+        for nd in [nd for nd in noeuds if int(nd.get("id")) in retires]:
+            racine.remove(nd)
+        noeuds[:] = [nd for nd in noeuds if int(nd.get("id")) not in retires]
+    return retires, ecart_max

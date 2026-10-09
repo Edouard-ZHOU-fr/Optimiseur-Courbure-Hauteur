@@ -57,7 +57,9 @@ from utils.trajectoire import lisser_altitude, preparer_trajectoire
 from utils.courbure import appliquer_correction_courbure
 from utils.aoi import (Centrelignes, SOUS_TYPES_NON_ROULABLES,
                        corriger_courbure_aoi, densifier_bornes, jacobien_geo,
-                       lire_topologie, lisser_altitude_graphe, orienter_bornes)
+                       elaguer_noeuds_inseres, lire_topologie,
+                       lisser_altitude_graphe, noeuds_proteges, orienter_bornes,
+                       controle_courbure, N_PASSES_ELAGAGE)
 from utils.entrees_sorties import (apparier, charger_carte, charger_trajectoire,
                                    ecrire_carte, ecrire_trajectoire)
 from utils.figures import tracer, tracer_aoi
@@ -133,23 +135,29 @@ def traiter_aoi(a, jrn, arbre, noeuds, pts_carte, k_max, sortie_carte):
         contexte.update(debuts.get((g[-1], d[-1]), []))
     contexte -= selection
 
+    inseres = set()
     if a.noeuds_ajoutes_max > 0:
-        n_ins, n_b, n_part = densifier_bornes(
+        inseres, n_b, n_part = densifier_bornes(
             arbre, noeuds, ways, voies, xy_de, z_de, bornes, selection,
             lanelets, debuts, fins, a.noeuds_ajoutes_max, a.pas_reech,
             a.precision)
         jrn("  noeuds inseres          : %d sur %d borne(s) (max %d par borne)%s"
-            % (n_ins, n_b, a.noeuds_ajoutes_max,
+            % (len(inseres), n_b, a.noeuds_ajoutes_max,
                ", %d borne(s) partagee(s) hors AOI non densifiee(s)" % n_part
                if n_part else ""))
 
     # un noeud partage avec un lanelet roulable hors selection reste fixe
     fixes = {int(i) for lid, b in roulables.items() if lid not in selection
              for i in np.concatenate(b)}
-    cl = Centrelignes({lid: bornes[lid] for lid in sorted(selection | contexte)},
-                      xy, a.pas_reech)
-    a_bouger = {int(i) for lid in selection for i in np.concatenate(bornes[lid])} - fixes
-    mobile = np.array([i in a_bouger for i in cl.ids])
+
+    def construire():
+        cl = Centrelignes({lid: bornes[lid] for lid in sorted(selection | contexte)},
+                          xy, a.pas_reech)
+        a_bouger = ({int(i) for lid in selection for i in np.concatenate(bornes[lid])}
+                    - fixes)
+        return cl, np.array([i in a_bouger for i in cl.ids])
+
+    cl, mobile = construire()
     jrn("  lanelets selectionnes   : %d  (%s)"
         % (len(selection), " ".join(str(i) for i in sorted(selection))))
     jrn("  lanelets voisins figes  : %d (predecesseurs/successeurs hors AOI)"
@@ -157,33 +165,97 @@ def traiter_aoi(a, jrn, arbre, noeuds, pts_carte, k_max, sortie_carte):
     jrn("  noeuds de bornes        : %d mobiles, %d figes (partages hors selection)"
         % (mobile.sum(), (~mobile).sum()))
 
-    P0 = xy(cl.ids)
-    z0 = np.array([z_de[i] for i in cl.ids])
     fenetre_lat = 0.0 if a.sans_lissage_lateral else a.fenetre_laterale
-    if a.sans_courbure and fenetre_lat <= 0:
-        jrn.titre("Etape A2 : lissage lateral et correction de courbure DESACTIVES")
-        P, residus, k_av, k_ap = P0, [], None, None
-    else:
-        P, residus, k_av, k_ap = corriger_courbure_aoi(
-            cl, P0, mobile, selection, contexte, k_max, a.ecart_max, a.pas_reech,
-            a.base_courbure, a.empattement, fenetre_lat, not a.sans_courbure,
-            jrn)
 
-    jrn.titre("Etape A3 : lissage de l'altitude des bornes")
-    if a.sans_lissage_z:
-        jrn("  lissage de l'altitude desactive")
-        z = z0
+    def optimiser(cl, mobile, jrn):
+        """Etapes A2 et A3, toujours depuis la geometrie d'origine (xy_de,
+        z_de ; milieu de segment pour un noeud insere)."""
+        P0 = xy(cl.ids)
+        z0 = np.array([z_de[i] for i in cl.ids])
+        if a.sans_courbure and fenetre_lat <= 0:
+            jrn.titre("Etape A2 : lissage lateral et correction de courbure DESACTIVES")
+            P, residus, k_av, k_ap = P0, [], None, None
+        else:
+            P, residus, k_av, k_ap = corriger_courbure_aoi(
+                cl, P0, mobile, selection, contexte, k_max, a.ecart_max,
+                a.pas_reech, a.base_courbure, a.empattement, fenetre_lat,
+                not a.sans_courbure, jrn)
+
+        jrn.titre("Etape A3 : lissage de l'altitude des bornes")
+        if a.sans_lissage_z:
+            jrn("  lissage de l'altitude desactive")
+            z = z0
+        else:
+            aretes = {tuple(sorted((cl.col[int(u)], cl.col[int(v)])))
+                      for lid in selection | contexte for b in bornes[lid]
+                      for u, v in zip(b[:-1], b[1:]) if u != v}
+            z = lisser_altitude_graphe(np.array(sorted(aretes)), P, z0, mobile,
+                                       a.fenetre_z)
+            dz = np.abs(z - z0)[mobile]
+            jrn("  lissage le long des bornes : fenetre %.1f m, aucune donnee de "
+                "trajectoire" % a.fenetre_z)
+            jrn("  ecart d'altitude           : moyen %.3f m, max %.3f m"
+                % (dz.mean() if len(dz) else 0.0, dz.max(initial=0.0)))
+        return P0, z0, P, z, residus, k_av, k_ap
+
+    # A2 -> A3 -> elagage des noeuds inseres restes alignes, repete tant que
+    # l'elagage retire des noeuds : chaque passe repart de la geometrie
+    # d'origine avec les noeuds restants. La geometrie ecrite est ainsi
+    # exactement celle qu'A2 et A3 ont optimisee et verifiee (budget d'ecart,
+    # aucun nouveau depassement de k_max) ; le rapport la decrit.
+    restants, bilan_passes = set(inseres), []
+    tol = a.tolerance_noeuds_inseres
+    for _ in range(N_PASSES_ELAGAGE):
+        jp = Journal(verbeux=False)
+        P0, z0, P, z, residus, k_av, k_ap = optimiser(cl, mobile, jp)
+        if not restants or tol <= 0:
+            break
+        position = {int(i): (x, y, zz) for i, (x, y), zz in zip(cl.ids, P, z)}
+        retires, _ = elaguer_noeuds_inseres(arbre, noeuds, ways, restants,
+                                            position, tol)
+        bilan_passes.append(len(retires))
+        if not retires:
+            break
+        restants -= retires
+        for lid in selection:
+            bornes[lid] = tuple(np.array([i for i in b if int(i) not in retires])
+                                for b in bornes[lid])
+        cl, mobile = construire()
     else:
-        aretes = {tuple(sorted((cl.col[int(u)], cl.col[int(v)])))
-                  for lid in selection | contexte for b in bornes[lid]
-                  for u, v in zip(b[:-1], b[1:]) if u != v}
-        z = lisser_altitude_graphe(np.array(sorted(aretes)), P, z0, mobile,
-                                   a.fenetre_z)
-        dz = np.abs(z - z0)[mobile]
-        jrn("  lissage le long des bornes : fenetre %.1f m, aucune donnee de "
-            "trajectoire" % a.fenetre_z)
-        jrn("  ecart d'altitude           : moyen %.3f m, max %.3f m"
-            % (dz.mean() if len(dz) else 0.0, dz.max(initial=0.0)))
+        # nombre de passes atteint avec un dernier elagage : re-optimiser
+        jp = Journal(verbeux=False)
+        P0, z0, P, z, residus, k_av, k_ap = optimiser(cl, mobile, jp)
+    for ligne in jp.lignes:
+        jrn(ligne)
+
+    if inseres:
+        jrn.titre("Etape A3b : elagage des noeuds inseres")
+        if tol <= 0:
+            jrn("  elagage desactive (tolerance_noeuds_inseres = 0)")
+        for k, n in enumerate(bilan_passes, 1):
+            jrn("  passe %d : %d noeud(s) retire(s)%s"
+                % (k, n, " (alignes a moins de %.3f m de leurs voisins), "
+                   "nouvelle passe A2 + A3 depuis la geometrie d'origine"
+                   % tol if n else " : geometrie stable"))
+        jrn("  noeuds inseres          : %d, dont %d retires, %d conserves"
+            % (len(inseres), len(inseres) - len(restants), len(restants)))
+        jrn("  A2 et A3 ci-dessus      : derniere passe, geometrie ecrite")
+
+    if k_ap is not None:
+        # controle de la geometrie ecrite, centrelignes re-echantillonnees
+        xy_fin = {int(i): p for i, p in zip(cl.ids, P)}
+        kc, nc, tc = controle_courbure(
+            bornes, lambda ids: np.array([xy_fin[int(i)] for i in ids]),
+            a.pas_reech, a.base_courbure, selection, contexte, k_max)
+        jrn.titre("Controle de la carte ecrite")
+        jrn("  centrelignes re-echantillonnees sur la geometrie finale (comme "
+            "Autoware au chargement)")
+        jrn("  k max %.4f 1/m (A2 : %.4f), points en exces %d (A2 : %d), "
+            "|dk/ds| max %.4f 1/m2"
+            % (kc, k_ap.max(initial=0.0), nc, int((k_ap > k_max).sum()), tc))
+        if nc > int((k_ap > k_max).sum()):
+            jrn("  /!\\ plus de depassements qu'annonce par A2 : ecart du a "
+                "l'echantillonnage, a verifier")
 
     seuil = 0.5 * 10.0 ** -a.precision
     dico = {int(i): float(zz) for i, zz, zz0 in zip(cl.ids, z, z0)
@@ -253,6 +325,14 @@ def traiter_trajectoire(a, jrn, pts_traj, arbre, noeuds, pts_carte, k_max,
     # 7 --------------------------------------------------------------------
     dico = apparier(pts_final, pts_carte, a.distance_max, a.offset_capteur,
                     a.ecart_min_z, a.ele_nul_mediane, jrn)
+    # feux, signaux... : leur ele est leur propre altitude, pas celle de la route
+    proteges, n_ways = noeuds_proteges(arbre, set(a.types_proteges))
+    retires = proteges & set(dico)
+    for i in retires:
+        del dico[i]
+    jrn("  noeuds proteges          : %d (%d way(s) %s), dont %d retires des "
+        "modifications" % (len(proteges), n_ways,
+                           "/".join(a.types_proteges) or "-", len(retires)))
 
     # 8 --------------------------------------------------------------------
     ecrire_carte(arbre, noeuds, dico, str(sortie_carte), a.precision, jrn)

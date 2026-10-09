@@ -52,6 +52,7 @@ SCHEMA = {
         "fenetre_laterale": (float, False),
         "sans_lissage_lateral": (bool, False),
         "noeuds_ajoutes_max": (int, False),
+        "tolerance_noeuds_inseres": (float, False),
     },
     # ---- mode trajectoire seulement (lu mais sans effet en mode AOI)
     "mode_trajectoire": {
@@ -63,6 +64,7 @@ SCHEMA = {
         "ecart_min_z": (float, False),
         "offset_capteur": (float, True),
         "ele_nul_mediane": (bool, False),
+        "types_proteges": ("liste_texte", False),
     },
 }
 
@@ -75,6 +77,10 @@ def _convertir(val, typ, nullable, ou):
         if nullable:
             return None
         raise ValueError("%s : valeur obligatoire (null interdit)" % ou)
+    if typ == "liste_texte":
+        if not isinstance(val, list) or not all(isinstance(v, str) for v in val):
+            raise ValueError("%s : liste de textes attendue, lu %r" % (ou, val))
+        return list(val)
     if typ == "chemin":
         if not isinstance(val, str) or not val.strip():
             raise ValueError("%s : chemin attendu, lu %r" % (ou, val))

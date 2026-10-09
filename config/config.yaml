@@ -41,7 +41,9 @@ vehicule:
   marge_courbure: null          # facteur de garde sur la courbure (<1 = plus severe)
 
 courbure:
-  ecart_max: 0.30               # deplacement lateral maximal d'un point / noeud (m)
+  ecart_max: 0.30               # deplacement lateral maximal d'un point / noeud (m),
+                                # depuis la geometrie d'origine (budget commun a toutes
+                                # les etapes : borne stricte de l'ecart a la carte d'origine)
   pas_reech: 1.0                # pas de reechantillonnage (m)
   sans_courbure: false          # desactiver la correction des depassements de k_max
 
@@ -57,13 +59,16 @@ mode_aoi:
   base_courbure: null           # demi-base de mesure de la courbure (m) ; null : empattement
   fenetre_laterale: 10.0        # longueur d'onde de coupure du lissage lateral (m)
   sans_lissage_lateral: false   # desactiver le lissage lateral
-  noeuds_ajoutes_max: 3         # noeuds inseres au plus par borne (0 = aucun)
+  noeuds_ajoutes_max: 300         # noeuds inseres au plus par borne (0 = aucun)
+  tolerance_noeuds_inseres: 0.01 # (m) apres lissage, un noeud insere encore aligne
+                                # avec ses voisins a moins de cette distance (en plan
+                                # et en altitude) est retire : il n'apporte rien
 
 
 # ================ Mode trajectoire (aoi: false) - ignore en mode AOI =======
 
 mode_trajectoire:
-  traj: traj.csv                # trajectoire CSV x,y,z[,yaw]
+  traj: traj.csv       # trajectoire CSV x,y,z[,yaw]
   sortie_traj: null             # null : <traj>_OUT.csv
   pas_min: 0.30                 # distance min entre points bruts conserves (m)
   seuil_rebroussement: 90.0     # variation de cap au-dela de laquelle on coupe (deg)
@@ -71,3 +76,8 @@ mode_trajectoire:
   ecart_min_z: 0.20             # ecart d'altitude en deca duquel on ne modifie pas (m)
   offset_capteur: null          # hauteur soustraite a Z (m) ; null : hauteur_capteur du modele
   ele_nul_mediane: false        # altitude mediane aux noeuds ele=0 sans voisin
+  # ways dont les noeuds ne sont jamais recales (elements en hauteur : leur ele
+  # est une altitude propre, pas celle de la chaussee) ; [] : aucun
+  # types_proteges: [traffic_light, light_bulbs, traffic_sign]
+  types_proteges: [traffic_light, light_bulbs]
+
